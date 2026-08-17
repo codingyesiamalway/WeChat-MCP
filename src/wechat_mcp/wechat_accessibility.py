@@ -89,7 +89,18 @@ def get_wechat_ax_app() -> Any:
     logger.info(
         "Activated WeChat (bundle_id=%s, pid=%s)", bundle_id, app.processIdentifier()
     )
-    return AXUIElementCreateApplication(app.processIdentifier())
+    ax_app = AXUIElementCreateApplication(app.processIdentifier())
+
+    # WeChat can keep document/PDF viewer windows in front of its main chat
+    # window. Coordinate-based clicks aimed at chat rows then land on the
+    # viewer instead. Explicitly raise the main window before any UI lookup or
+    # synthesized click.
+    main_window = _find_window_by_title(ax_app, "WeChat")
+    if main_window is not None:
+        AXUIElementPerformAction(main_window, kAXRaiseAction)
+        logger.info("Raised the main WeChat window")
+
+    return ax_app
 
 
 def _find_window_by_title(ax_app: Any, title: str):
