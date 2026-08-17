@@ -60,48 +60,74 @@ def capture_message_area(msg_list: Any):
     return image, origin, size
 
 
-def scroll_to_bottom(msg_list: Any, center: tuple[float, float]) -> None:
+def _viewport_signature(msg_list: Any) -> tuple[tuple[str, float | None], ...]:
+    """Return visible message text and vertical positions for scroll detection."""
+    signature: list[tuple[str, float | None]] = []
+    children = ax_get(msg_list, kAXChildrenAttribute) or []
+    for child in children:
+        text = ax_get(child, kAXValueAttribute) or ax_get(child, kAXTitleAttribute)
+        if not text:
+            continue
+        point = axvalue_to_point(ax_get(child, kAXPositionAttribute))
+        y = round(point[1], 1) if point is not None else None
+        signature.append((str(text), y))
+    return tuple(signature)
+
+
+def _wait_for_viewport_change(
+    msg_list: Any,
+    previous: tuple[tuple[str, float | None], ...],
+    timeout: float = 0.75,
+    poll_interval: float = 0.05,
+) -> tuple[tuple[str, float | None], ...]:
+    """Wait briefly for WeChat to apply a scroll or lazy-load history."""
+    deadline = time.monotonic() + timeout
+    current = _viewport_signature(msg_list)
+    while current == previous and time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        current = _viewport_signature(msg_list)
+    return current
+
+
+def _scroll_and_wait_for_change(
+    msg_list: Any,
+    center: tuple[float, float],
+    delta_lines: int,
+) -> bool:
+    """Post one scroll event and report whether the message viewport moved."""
+    previous = _viewport_signature(msg_list)
+    post_scroll(center, delta_lines)
+    current = _wait_for_viewport_change(msg_list, previous)
+    return current != previous
+
+
+def scroll_to_bottom(
+    msg_list: Any,
+    center: tuple[float, float],
+    max_scrolls: int = 1000,
+    stable_attempts: int = 5,
+) -> None:
     """
     Scroll the messages list to the bottom (newest messages) by repeatedly
     sending large negative scroll events until the last visible message
     stabilizes.
     """
-    last_text: str | None = None
     stable = 0
-
-    for _ in range(40):
-        # Negative delta moves towards newer messages (bottom of history).
-        post_scroll(center, -1000)
-        time.sleep(0.05)
-
-        children = ax_get(msg_list, kAXChildrenAttribute) or []
-        texts: list[str] = []
-        for child in children:
-            txt = ax_get(child, kAXValueAttribute) or ax_get(child, kAXTitleAttribute)
-            if txt:
-                texts.append(str(txt))
-        if not texts:
+    for _ in range(max_scrolls):
+        if _scroll_and_wait_for_change(msg_list, center, -1000):
+            stable = 0
             continue
 
-        new_last = texts[-1]
-        if new_last == last_text:
-            stable += 1
-            if stable >= 3:
-                break
-        else:
-            last_text = new_last
-            stable = 0
+        stable += 1
+        if stable >= stable_attempts:
+            break
+    else:
+        logger.warning(
+            "Could not confirm the bottom of chat history after %d scrolls",
+            max_scrolls,
+        )
 
     time.sleep(0.2)
-
-
-def scroll_up_small(center: tuple[float, float]) -> None:
-    """
-    Scroll slightly upwards to reveal older messages.
-    """
-    # Positive delta scrolls towards older messages.
-    post_scroll(center, 50)
-    time.sleep(0.1)
 
 
 def count_colored_pixels(
@@ -193,6 +219,48 @@ class ChatMessage:
         return asdict(self)
 
 
+def _merge_older_messages(
+    visible: list[ChatMessage], messages: list[ChatMessage]
+) -> tuple[list[ChatMessage], int]:
+    """Prepend a viewport using its longest overlap with collected messages."""
+    if not messages:
+        return list(visible), len(visible)
+
+    visible_text = [message.text for message in visible]
+    message_text = [message.text for message in messages]
+    max_overlap = min(len(visible_text), len(message_text))
+
+    for overlap in range(max_overlap, 0, -1):
+        if visible_text[-overlap:] == message_text[:overlap]:
+            new_older = visible[:-overlap]
+            return new_older + messages, len(new_older)
+
+    return visible + messages, len(visible)
+
+
+def _collect_visible_messages(msg_list: Any) -> list[ChatMessage]:
+    """Capture and classify the messages currently exposed by Accessibility."""
+    image, list_origin, _ = capture_message_area(msg_list)
+    children = ax_get(msg_list, kAXChildrenAttribute) or []
+    visible: list[ChatMessage] = []
+
+    for child in children:
+        text = ax_get(child, kAXValueAttribute) or ax_get(child, kAXTitleAttribute)
+        if not text:
+            continue
+
+        point = axvalue_to_point(ax_get(child, kAXPositionAttribute))
+        size = axvalue_to_size(ax_get(child, kAXSizeAttribute))
+        if point is None or size is None:
+            sender: SenderLabel = "UNKNOWN"
+        else:
+            sender = classify_sender_for_message(image, list_origin, point, size)
+
+        visible.append(ChatMessage(sender=sender, text=str(text)))
+
+    return visible
+
+
 def fetch_recent_messages(
     last_n: int = 100, max_scrolls: int | None = None
 ) -> list[ChatMessage]:
@@ -207,8 +275,10 @@ def fetch_recent_messages(
       collects all visible messages plus their positions/sizes.
     - Classifies each message as ME/OTHER/UNKNOWN using the same
       screenshot-based heuristic as before.
-    - Merges newly revealed older messages at the front of the list by
-      aligning on the oldest already-known message text.
+    - Waits for each viewport change so lazy-loaded history is not mistaken
+      for the top of the conversation.
+    - Merges newly revealed older messages using the longest shared sequence,
+      which is resilient to repeated message text.
     """
     ax_app = get_wechat_ax_app()
     msg_list = get_messages_list(ax_app)
@@ -217,65 +287,32 @@ def fetch_recent_messages(
 
     messages: list[ChatMessage] = []
     scrolls = 0
-    no_new_counter = 0
+    stalled_scrolls = 0
 
     while True:
-        image, list_origin, _ = capture_message_area(msg_list)
-
-        children = ax_get(msg_list, kAXChildrenAttribute) or []
-        visible: list[ChatMessage] = []
-
-        for child in children:
-            text = ax_get(child, kAXValueAttribute) or ax_get(child, kAXTitleAttribute)
-            if not text:
-                continue
-
-            pos_ref = ax_get(child, kAXPositionAttribute)
-            size_ref = ax_get(child, kAXSizeAttribute)
-            point = axvalue_to_point(pos_ref)
-            size = axvalue_to_size(size_ref)
-            if point is None or size is None:
-                sender: SenderLabel = "UNKNOWN"
-            else:
-                sender = classify_sender_for_message(image, list_origin, point, size)
-
-            visible.append(ChatMessage(sender=sender, text=str(text)))
+        visible = _collect_visible_messages(msg_list)
 
         if not visible:
             break
 
-        if not messages:
-            messages = visible
-        else:
-            # Align on the oldest already-known message using its text as anchor.
-            anchor_text = messages[0].text
-            idx: int | None = None
-            for i, msg in enumerate(visible):
-                if msg.text == anchor_text:
-                    idx = i
-                    break
-
-            if idx is None:
-                new_older = visible
-            else:
-                new_older = visible[:idx]
-
-            if new_older:
-                messages = new_older + messages
-                no_new_counter = 0
-            else:
-                no_new_counter += 1
-                if no_new_counter >= 5:
-                    break
+        messages, added = _merge_older_messages(visible, messages)
+        if added:
+            logger.debug("Collected %d older visible messages", added)
 
         if len(messages) >= last_n:
             break
 
-        scroll_up_small(center)
-
         scrolls += 1
         if max_scrolls is not None and scrolls >= max_scrolls:
             break
+
+        if _scroll_and_wait_for_change(msg_list, center, 50):
+            stalled_scrolls = 0
+        else:
+            stalled_scrolls += 1
+            if stalled_scrolls >= 5:
+                logger.info("Reached the top of the currently available chat history")
+                break
 
     if len(messages) > last_n:
         messages = messages[-last_n:]
